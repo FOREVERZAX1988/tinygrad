@@ -1,10 +1,10 @@
 from __future__ import annotations
 from typing import cast, Any, Sequence
-import functools, itertools, weakref, ctypes, struct, time
+import functools, itertools, weakref, ctypes, struct, time, hashlib, pathlib
 from dataclasses import replace, dataclass, field
 from collections import defaultdict
 from tinygrad.helpers import dedup, pluralize, unwrap, to_tuple, ContextVar, Context, panic, partition, getenv, to_name
-from tinygrad.helpers import DEBUG, VIZ, DEV, ALL2ALL, PROFILE
+from tinygrad.helpers import DEBUG, VIZ, DEV, ALL2ALL, PROFILE, diskcache_get, diskcache_put
 from tinygrad.device import Device, Buffer, BufferSpec, Compiled, TinyELF, HCQ_RUNTIME_DEV, ProfileProgramEvent
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo, GroupOp, graph_rewrite, rewrite_group, exec_alu, uopfunc, sym_infer
 from tinygrad.uop.ops import pm_renumber_slots
@@ -537,6 +537,15 @@ pm_encode = PatternMatcher([(UPat(Ops.CALL, src=(UPat(Ops.SINK),), name="call", 
 
 hcq_compile_cache:dict[tuple[UOp, bool, bool], UOp] = {} # eager templates: a buffer-free linear (uops are hash-consed) to its compiled form
 
+@functools.cache
+def _source_stamp() -> str:
+  files = sorted((str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in pathlib.Path(__file__).parents[2].rglob("*.py"))
+  return hashlib.sha256(str(files).encode()).hexdigest()
+
+def _disk_key(linear:UOp, profile:bool) -> str:
+  devs = sorted({d for c in linear.src if (ds:=get_enqueue_devs(c)) is not None for d in to_tuple(ds)} | {HCQ_RUNTIME_DEV.value})
+  return "|".join([_source_stamp(), linear.key.hex(), str(profile), str(ALL2ALL >= 1), *(f"{d}={Device[d].renderer.target!r}" for d in devs)])
+
 @rewrite_group(lambda linear,input_uops,profile,cache=False,ret=None: f"HCQ Compile {pluralize('Kernel', len(ret.src))}")
 def hcq_compile(linear:UOp, input_uops:list[UOp]|None, profile:bool, cache=False) -> UOp:
   if any(isinstance(getattr(c.without_after.arg, "aux", None), HCQInfo) for c in linear.src): return linear # compiled already
@@ -547,9 +556,12 @@ def hcq_compile(linear:UOp, input_uops:list[UOp]|None, profile:bool, cache=False
     linear = graph_rewrite(linear, pm_replace_buffers, ctx=(use_rt, input_uops, slots), walk=True, name="replace buffers")
   linear = graph_rewrite(linear, pm_unwrap_multi+pm_insert_copy_staging+pm_flatten_linear, name="prep calls")
   if cache and input_uops is not None and (cached:=hcq_compile_cache.get(key:=(linear, profile, ALL2ALL >= 1))) is not None: return cached
+  if cache and input_uops is not None and (cached:=diskcache_get("hcq_compile", disk_key:=_disk_key(linear, profile))) is not None:
+    hcq_compile_cache[key] = cached
+    return cached
   lin = graph_rewrite(sched_batches(linear, profile), pm_encode, walk=True, name="encode")
   with Context(EMULATED_DTYPES=""): final_linear = lower_and_compile(lin, verbose=DEBUG>=3)
-  if cache and input_uops is not None and final_linear is not linear: hcq_compile_cache[key] = final_linear
+  if cache and input_uops is not None and final_linear is not linear: hcq_compile_cache[key] = diskcache_put("hcq_compile", disk_key, final_linear)
   return final_linear
 
 # *****************
